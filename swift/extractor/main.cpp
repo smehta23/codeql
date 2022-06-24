@@ -163,56 +163,57 @@ static void patchFrontendOptions(std::vector<std::string>& frontendOptions) {
 static void attemptToCopyMergedModule(const std::vector<std::string>& options) {
   // DerivedData/MovieSwift/Build/Intermediates.noindex/SwiftUIFlux.build/Debug-iphoneos/SwiftUIFlux.build/Objects-normal/arm64/SwiftUIFlux.swiftmodule
   // DerivedData/MovieSwift/Build/Products/Debug-iphoneos/SwiftUIFlux.swiftmodule/arm64.swiftmodule
-  if (options[0] == "-merge-modules") {
-    llvm::StringRef modulePath;
-    for (size_t i = 0; i < options.size(); i++) {
-      if (options[i] == "-o") {
+  llvm::StringRef modulePath;
+  for (size_t i = 0; i < options.size(); i++) {
+    if (options[i] == "-o" || options[i] == "-emit-module-path") {
+      llvm::StringRef path(options[i + 1]);
+      if (path.endswith(".swiftmodule")) {
         modulePath = options[i + 1];
       }
     }
-    if (modulePath.empty()) {
-      return;
-    }
+  }
+  if (modulePath.empty()) {
+    return;
+  }
 
-    llvm::SmallVector<llvm::StringRef> chunks;
-    modulePath.split(chunks, '/');
-    size_t intermediatesDirIndex = 0;
-    for (size_t i = 0; i < chunks.size(); i++) {
-      // Intermediates.noindex
-      if (chunks[i] == "Intermediates.noindex") {
-        intermediatesDirIndex = i;
-        break;
-      }
+  llvm::SmallVector<llvm::StringRef> chunks;
+  modulePath.split(chunks, '/');
+  size_t intermediatesDirIndex = 0;
+  for (size_t i = 0; i < chunks.size(); i++) {
+    if (chunks[i] == "Intermediates.noindex") {
+      intermediatesDirIndex = i;
+      break;
     }
-    if (intermediatesDirIndex == 0) {
-      return;
-    }
-    // e.g. Denug-iphones, Release-iphonesimulator, etc.
-    auto destinationDir = chunks[intermediatesDirIndex + 2].str();
-    auto arch = chunks[intermediatesDirIndex + 5].str();
-    auto moduleName = chunks.back().str();
-    std::string relocatedModulePath;
-    for (size_t i = 0; i < intermediatesDirIndex; i++) {
-      relocatedModulePath += '/' + chunks[i].str();
-    }
-    relocatedModulePath += "/Products/";
-    relocatedModulePath += destinationDir + '/';
-    relocatedModulePath += moduleName + '/';
-    relocatedModulePath += arch + ".swiftmodule";
-    llvm::SmallString<PATH_MAX> filepath(relocatedModulePath);
-    llvm::StringRef parent = llvm::sys::path::parent_path(filepath);
-    if (std::error_code ec = llvm::sys::fs::create_directories(parent)) {
-      std::cerr << "Cannot create relocated module path: " << ec.message() << "\n";
-      return;
-    }
+  }
+  // Not built by Xcode, skipping
+  if (intermediatesDirIndex == 0) {
+    return;
+  }
+  // e.g. Debug-iphoneos, Release-iphonesimulator, etc.
+  auto destinationDir = chunks[intermediatesDirIndex + 2].str();
+  auto arch = chunks[intermediatesDirIndex + 5].str();
+  auto moduleName = chunks.back().str();
+  std::string relocatedModulePath;
+  for (size_t i = 0; i < intermediatesDirIndex; i++) {
+    relocatedModulePath += '/' + chunks[i].str();
+  }
+  relocatedModulePath += "/Products/";
+  relocatedModulePath += destinationDir + '/';
+  relocatedModulePath += moduleName + '/';
+  relocatedModulePath += arch + ".swiftmodule";
+  llvm::SmallString<PATH_MAX> filepath(relocatedModulePath);
+  llvm::StringRef parent = llvm::sys::path::parent_path(filepath);
+  if (std::error_code ec = llvm::sys::fs::create_directories(parent)) {
+    std::cerr << "Cannot create relocated module path: " << ec.message() << "\n";
+    return;
+  }
 
-    llvm::SmallString<PATH_MAX> srcFilePath(modulePath);
-    llvm::SmallString<PATH_MAX> dstFilePath(relocatedModulePath);
+  llvm::SmallString<PATH_MAX> srcFilePath(modulePath);
+  llvm::SmallString<PATH_MAX> dstFilePath(relocatedModulePath);
 
-    if (std::error_code ec = llvm::sys::fs::copy_file(srcFilePath, dstFilePath)) {
-      std::cerr << "Cannot relocate archive '" << srcFilePath.str().str() << "' -> '"
-                << dstFilePath.str().str() << "': " << ec.message() << "\n";
-    }
+  if (std::error_code ec = llvm::sys::fs::copy_file(srcFilePath, dstFilePath)) {
+    std::cerr << "Cannot relocate archive '" << srcFilePath.str().str() << "' -> '"
+              << dstFilePath.str().str() << "': " << ec.message() << "\n";
   }
 }
 
