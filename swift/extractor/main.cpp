@@ -15,6 +15,7 @@
 #include <llvm/Support/Path.h>
 #include <swift/Basic/OutputFileMap.h>
 #include <unistd.h>
+#include <swift/Basic/Platform.h>
 
 #include "SwiftExtractor.h"
 
@@ -28,32 +29,39 @@ class Observer : public swift::FrontendObserver {
   explicit Observer(const codeql::SwiftExtractorConfiguration& config) : config{config} {}
 
   void parsedArgs(swift::CompilerInvocation& invocation) override {
+    auto& overlays = invocation.getSearchPathOptions().VFSOverlayFiles;
+
+    /* overlays.push_back("/opt/GitHub/semmle-code/ql/swift/integration-tests/partial-modules/vfs.yaml");
+     */
+
+    std::cerr << "SETUP VFS: " << std::to_string(getpid()) << "\n";
+
     auto vfsPath = config.scratchDir + "/vfs/";
     if (llvm::sys::fs::exists(vfsPath)) {
-      auto& overlays = invocation.getSearchPathOptions().VFSOverlayFiles;
       std::error_code ec;
       llvm::sys::fs::directory_iterator it(vfsPath, ec);
       // std::cerr << "VFS dir it: " << it->path() << ": " << ec.message() << "\n";
       while (!ec && it != llvm::sys::fs::directory_iterator()) {
-        std::cerr << "VFS ENTRY: " << it->path() << "\n";
         llvm::StringRef path(it->path());
         if (path.endswith("vfs.yaml")) {
-          overlays.push_back(path.str());
+          std::cerr << "VFS ENTRY: " << path.str() << "\n";
+          invocation.getSearchPathOptions().VFSOverlayFiles.push_back(path.str());
         }
         it.increment(ec);
       }
     }
   }
 
-  void configuredCompiler(swift::CompilerInstance& compiler) override {
-    outputs = compiler.getInvocation().getFrontendOptions().InputsAndOutputs.copyOutputFilenames();
-  }
+  /* void configuredCompiler(swift::CompilerInstance& compiler) override { */
+  /*   outputs =
+   * compiler.getInvocation().getFrontendOptions().InputsAndOutputs.copyOutputFilenames(); */
+  /* } */
 
   void performedSemanticAnalysis(swift::CompilerInstance& compiler) override {
     codeql::extractSwiftFiles(config, compiler);
   }
 
-  std::vector<std::string> outputs;
+  /* std::vector<std::string> outputs; */
 
  private:
   const codeql::SwiftExtractorConfiguration& config;
@@ -66,7 +74,8 @@ static std::string getenv_or(const char* envvar, const std::string& def) {
   return def;
 }
 
-static std::vector<std::string> getAliases(llvm::StringRef modulePath) {
+static std::vector<std::string> getAliases(llvm::StringRef modulePath,
+                                           const std::string& targetTriple) {
   if (modulePath.empty()) {
     return {};
   }
@@ -96,25 +105,34 @@ static std::vector<std::string> getAliases(llvm::StringRef modulePath) {
   relocatedModulePath += "/Products/";
   relocatedModulePath += destinationDir + '/';
 
+  std::vector<std::string> moduleLocations;
+
   std::string firstPath = relocatedModulePath;
   firstPath += moduleNameWithExt.str() + '/';
-  firstPath += arch + ".swiftmodule";
+  moduleLocations.push_back(firstPath);
 
   std::string secondPath = relocatedModulePath;
   secondPath += '/' + moduleName.str() + '/';
   secondPath += moduleNameWithExt.str() + '/';
-  secondPath += arch + ".swiftmodule";
+  moduleLocations.push_back(secondPath);
 
   std::string thirdPath = relocatedModulePath;
   thirdPath += '/' + moduleName.str() + '/';
   thirdPath += moduleName.str() + ".framework/Modules/";
   thirdPath += moduleNameWithExt.str() + '/';
-  thirdPath += arch + ".swiftmodule";
+  moduleLocations.push_back(thirdPath);
 
-  /* copyModule(modulePath.str(), firstPath); */
-  /* copyModule(modulePath.str(), secondPath); */
-  /* copyModule(modulePath.str(), thirdPath); */
-  return {firstPath, secondPath, thirdPath};
+  std::vector<std::string> aliases;
+  for (auto& location : moduleLocations) {
+    aliases.push_back(location + arch + ".swiftmodule");
+    if (!targetTriple.empty()) {
+      llvm::Triple triple(targetTriple);
+      auto moduleTriple = swift::getTargetSpecificModuleTriple(triple);
+      aliases.push_back(location + moduleTriple.normalize() + ".swiftmodule");
+    }
+  }
+
+  return aliases;
 }
 
 // TODO: move elsewhere
@@ -138,6 +156,8 @@ static void patchFrontendOptions(codeql::SwiftExtractorConfiguration& config,
       "-serialize-diagnostics-path",
   });
 
+  std::unordered_set<std::string> skipOne({"-Xcc"});
+
   std::unordered_set<std::string> searchPathRewriteOptions({"-I", "-F"});
 
   // Defaulting to then root assuming that all the paths are absolute
@@ -148,6 +168,8 @@ static void patchFrontendOptions(codeql::SwiftExtractorConfiguration& config,
   /* size_t supplementaryOutputsMapIndex = 0; */
   std::vector<size_t> outputFileMapIndexes;
   std::vector<std::string> maybeInput;
+
+  std::string targetTriple;
 
   std::vector<std::string> newLocations;
   for (size_t i = 0; i < frontendOptions.size(); i++) {
@@ -167,6 +189,10 @@ static void patchFrontendOptions(codeql::SwiftExtractorConfiguration& config,
       searchPathIndexes.push_back(i);
       // Skip the following argument
       i++;
+    } else if (frontendOptions[i] == "-target") {
+      targetTriple = frontendOptions[++i];
+    } else if (skipOne.count(frontendOptions[i])) {
+      i++;
     } else if (frontendOptions[i][0] != '-') {
       // Maybe it's an input file generated by a previous invocation
       // In which case attempt to rewrite the argument if the new path exists
@@ -179,49 +205,49 @@ static void patchFrontendOptions(codeql::SwiftExtractorConfiguration& config,
     }
   }
 
-  for (auto index : outputFileMapIndexes) {
-    auto oldPath = frontendOptions[index];
-    auto newPath = pathRewritePrefix + '/' + oldPath;
-    frontendOptions[index] = newPath;
+  /* for (auto index : outputFileMapIndexes) { */
+  /*   auto oldPath = frontendOptions[index]; */
+  /*   auto newPath = pathRewritePrefix + '/' + oldPath; */
+  /*   frontendOptions[index] = newPath; */
 
-    llvm::errs() << "DEBUGG: map" << newPath << "\n";
+  /*   llvm::errs() << "DEBUGG: map" << newPath << "\n"; */
 
-    // TODO: do not assume absolute path
-    auto outputMapOrError = swift::OutputFileMap::loadFromPath(oldPath, "");
-    if (outputMapOrError) {
-      auto oldOutputMap = outputMapOrError.get();
-      swift::OutputFileMap newOutputMap;
-      std::vector<llvm::StringRef> keys;
-      llvm::errs() << "DEBUGG: got map"
-                   << "\n";
-      for (auto& key : maybeInput) {
-        llvm::errs() << "DEBUGG: map key " << key << "\n";
-        auto oldMap = oldOutputMap.getOutputMapForInput(key);
-        if (oldMap) {
-          keys.push_back(key);
-          auto& newMap = newOutputMap.getOrCreateOutputMapForInput(key);
-          newMap.copyFrom(*oldMap);
-          for (auto& entry : newMap) {
-            auto oldPath = entry.getSecond();
-            auto newPath = pathRewritePrefix + '/' + oldPath;
-            entry.getSecond() = newPath;
-            llvm::errs() << "DEBUGG: rewritten entry " << entry.second << "\n";
-            remapping[oldPath] = newPath;
-          }
-        }
-      }
-      std::error_code ec;
-      llvm::SmallString<PATH_MAX> filepath(newPath);
-      llvm::StringRef parent = llvm::sys::path::parent_path(filepath);
-      if (std::error_code ec = llvm::sys::fs::create_directories(parent)) {
-        std::cerr << "Cannot create relocated output map dir: " << ec.message() << "\n";
-        return;
-      }
+  /*   // TODO: do not assume absolute path */
+  /*   auto outputMapOrError = swift::OutputFileMap::loadFromPath(oldPath, ""); */
+  /*   if (outputMapOrError) { */
+  /*     auto oldOutputMap = outputMapOrError.get(); */
+  /*     swift::OutputFileMap newOutputMap; */
+  /*     std::vector<llvm::StringRef> keys; */
+  /*     llvm::errs() << "DEBUGG: got map" */
+  /*                  << "\n"; */
+  /*     for (auto& key : maybeInput) { */
+  /*       llvm::errs() << "DEBUGG: map key " << key << "\n"; */
+  /*       auto oldMap = oldOutputMap.getOutputMapForInput(key); */
+  /*       if (oldMap) { */
+  /*         keys.push_back(key); */
+  /*         auto& newMap = newOutputMap.getOrCreateOutputMapForInput(key); */
+  /*         newMap.copyFrom(*oldMap); */
+  /*         for (auto& entry : newMap) { */
+  /*           auto oldPath = entry.getSecond(); */
+  /*           auto newPath = pathRewritePrefix + '/' + oldPath; */
+  /*           entry.getSecond() = newPath; */
+  /*           llvm::errs() << "DEBUGG: rewritten entry " << entry.second << "\n"; */
+  /*           remapping[oldPath] = newPath; */
+  /*         } */
+  /*       } */
+  /*     } */
+  /*     std::error_code ec; */
+  /*     llvm::SmallString<PATH_MAX> filepath(newPath); */
+  /*     llvm::StringRef parent = llvm::sys::path::parent_path(filepath); */
+  /*     if (std::error_code ec = llvm::sys::fs::create_directories(parent)) { */
+  /*       std::cerr << "Cannot create relocated output map dir: " << ec.message() << "\n"; */
+  /*       return; */
+  /*     } */
 
-      llvm::raw_fd_ostream fd(newPath, ec, llvm::sys::fs::OF_None);
-      newOutputMap.write(fd, keys);
-    }
-  }
+  /*     llvm::raw_fd_ostream fd(newPath, ec, llvm::sys::fs::OF_None); */
+  /*     newOutputMap.write(fd, keys); */
+  /*   } */
+  /* } */
 
   // Re-create the directories as Swift frontend expects them to be present
   for (auto& location : newLocations) {
@@ -233,15 +259,15 @@ static void patchFrontendOptions(codeql::SwiftExtractorConfiguration& config,
     }
   }
 
-  for (auto& [_, newPath] : remapping) {
-    llvm::StringRef path(newPath);
-    if (path.endswith(".swiftmodule")) {
-      auto aliases = getAliases(path);
-      for (auto& alias : aliases) {
-        remapping[alias] = newPath;
-      }
-    }
-  }
+  /* for (auto& [_, newPath] : remapping) { */
+  /*   llvm::StringRef path(newPath); */
+  /*   if (path.endswith(".swiftmodule")) { */
+  /*     auto aliases = getAliases(path, targetTriple); */
+  /*     for (auto& alias : aliases) { */
+  /*       remapping[alias] = newPath; */
+  /*     } */
+  /*   } */
+  /* } */
 
   auto vfsDir = config.scratchDir + "/vfs";
   {
@@ -251,45 +277,53 @@ static void patchFrontendOptions(codeql::SwiftExtractorConfiguration& config,
       return;
     }
   }
-  auto vfsPath = vfsDir + '/' + std::to_string(getpid()) + "-vfs.yaml";
-  std::error_code ec;
-  llvm::raw_fd_ostream fd(vfsPath, ec, llvm::sys::fs::OF_None);
-  if (ec) {
-    std::cerr << "Cannot create VFS file: '" << vfsPath << "': " << ec.message() << "\n";
-    return;
-  }
-  fd << "{ version: 0,\n";
-  fd << "  roots: [\n";
-  size_t i = 0;
+
+  std::unordered_map<std::string, std::string> modules;
   for (auto& [oldPath, newPath] : remapping) {
-    fd << "  {\n";
-    fd << "    type: 'file',\n";
-    fd << "    name: '" << oldPath << "\',\n";
-    fd << "    external-contents: '" << newPath << "\'\n";
-    fd << "  }";
-    if (++i != remapping.size()) {
-      fd << ",";
-    }
-    fd << "\n";
-  }
-  fd << "  ]\n";
-  fd << "}\n";
-
-  return;
-
-  std::reverse(std::begin(searchPathIndexes), std::end(searchPathIndexes));
-  for (auto index : searchPathIndexes) {
-    // Inserting new search path right before the existing ones
-    auto option = frontendOptions[index];
-    auto oldSearchPath = frontendOptions[index + 1];
-    auto newSearchPath = pathRewritePrefix + '/' + oldSearchPath;
-    if (llvm::sys::fs::exists(newSearchPath)) {
-      auto it = frontendOptions.begin();
-      std::advance(it, index);
-      it = frontendOptions.insert(it, newSearchPath);
-      frontendOptions.insert(it, option);
+    if (llvm::StringRef(oldPath).endswith(".swiftmodule")) {
+      modules[oldPath] = newPath;
     }
   }
+
+  if (!modules.empty()) {
+    auto vfsPath = vfsDir + '/' + std::to_string(getpid()) + "-vfs.yaml";
+    std::error_code ec;
+    llvm::raw_fd_ostream fd(vfsPath, ec, llvm::sys::fs::OF_None);
+    if (ec) {
+      std::cerr << "Cannot create VFS file: '" << vfsPath << "': " << ec.message() << "\n";
+      return;
+    }
+    fd << "{ version: 0,\n";
+    /* fd << "  use-external-names: false,\n"; */
+    fd << "  fallthrough: false,\n";
+    fd << "  roots: [\n";
+    for (auto& [oldPath, newPath] : modules) {
+      fd << "  {\n";
+      fd << "    type: 'file',\n";
+      fd << "    name: '" << oldPath << "\',\n";
+      fd << "    external-contents: '" << newPath << "\'\n";
+      fd << "  },\n";
+    }
+    fd << "  ]\n";
+    fd << "}\n";
+    fd.flush();
+  }
+
+  /*   return; */
+
+  /*   std::reverse(std::begin(searchPathIndexes), std::end(searchPathIndexes)); */
+  /*   for (auto index : searchPathIndexes) { */
+  /*     // Inserting new search path right before the existing ones */
+  /*     auto option = frontendOptions[index]; */
+  /*     auto oldSearchPath = frontendOptions[index + 1]; */
+  /*     auto newSearchPath = pathRewritePrefix + '/' + oldSearchPath; */
+  /*     if (llvm::sys::fs::exists(newSearchPath)) { */
+  /*       auto it = frontendOptions.begin(); */
+  /*       std::advance(it, index); */
+  /*       it = frontendOptions.insert(it, newSearchPath); */
+  /*       frontendOptions.insert(it, option); */
+  /*     } */
+  /*   } */
 }
 
 int main(int argc, char** argv) {
