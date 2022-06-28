@@ -14,6 +14,7 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Path.h>
 #include <swift/Basic/OutputFileMap.h>
+#include <unistd.h>
 
 #include "SwiftExtractor.h"
 
@@ -26,9 +27,33 @@ class Observer : public swift::FrontendObserver {
  public:
   explicit Observer(const codeql::SwiftExtractorConfiguration& config) : config{config} {}
 
+  void parsedArgs(swift::CompilerInvocation& invocation) override {
+    auto vfsPath = config.scratchDir + "/vfs/";
+    if (llvm::sys::fs::exists(vfsPath)) {
+      auto& overlays = invocation.getSearchPathOptions().VFSOverlayFiles;
+      std::error_code ec;
+      llvm::sys::fs::directory_iterator it(vfsPath, ec);
+      // std::cerr << "VFS dir it: " << it->path() << ": " << ec.message() << "\n";
+      while (!ec && it != llvm::sys::fs::directory_iterator()) {
+        std::cerr << "VFS ENTRY: " << it->path() << "\n";
+        llvm::StringRef path(it->path());
+        if (path.endswith("vfs.yaml")) {
+          overlays.push_back(path.str());
+        }
+        it.increment(ec);
+      }
+    }
+  }
+
+  void configuredCompiler(swift::CompilerInstance& compiler) override {
+    outputs = compiler.getInvocation().getFrontendOptions().InputsAndOutputs.copyOutputFilenames();
+  }
+
   void performedSemanticAnalysis(swift::CompilerInstance& compiler) override {
     codeql::extractSwiftFiles(config, compiler);
   }
+
+  std::vector<std::string> outputs;
 
  private:
   const codeql::SwiftExtractorConfiguration& config;
@@ -41,8 +66,62 @@ static std::string getenv_or(const char* envvar, const std::string& def) {
   return def;
 }
 
+static std::vector<std::string> getAliases(llvm::StringRef modulePath) {
+  if (modulePath.empty()) {
+    return {};
+  }
+
+  llvm::SmallVector<llvm::StringRef> chunks;
+  modulePath.split(chunks, '/');
+  size_t intermediatesDirIndex = 0;
+  for (size_t i = 0; i < chunks.size(); i++) {
+    if (chunks[i] == "Intermediates.noindex") {
+      intermediatesDirIndex = i;
+      break;
+    }
+  }
+  // Not built by Xcode, skipping
+  if (intermediatesDirIndex == 0) {
+    return {};
+  }
+  // e.g. Debug-iphoneos, Release-iphonesimulator, etc.
+  auto destinationDir = chunks[intermediatesDirIndex + 2].str();
+  auto arch = chunks[intermediatesDirIndex + 5].str();
+  auto moduleNameWithExt = chunks.back();
+  auto moduleName = moduleNameWithExt.substr(0, moduleNameWithExt.find_last_of('.'));
+  std::string relocatedModulePath;
+  for (size_t i = 0; i < intermediatesDirIndex; i++) {
+    relocatedModulePath += '/' + chunks[i].str();
+  }
+  relocatedModulePath += "/Products/";
+  relocatedModulePath += destinationDir + '/';
+
+  std::string firstPath = relocatedModulePath;
+  firstPath += moduleNameWithExt.str() + '/';
+  firstPath += arch + ".swiftmodule";
+
+  std::string secondPath = relocatedModulePath;
+  secondPath += '/' + moduleName.str() + '/';
+  secondPath += moduleNameWithExt.str() + '/';
+  secondPath += arch + ".swiftmodule";
+
+  std::string thirdPath = relocatedModulePath;
+  thirdPath += '/' + moduleName.str() + '/';
+  thirdPath += moduleName.str() + ".framework/Modules/";
+  thirdPath += moduleNameWithExt.str() + '/';
+  thirdPath += arch + ".swiftmodule";
+
+  /* copyModule(modulePath.str(), firstPath); */
+  /* copyModule(modulePath.str(), secondPath); */
+  /* copyModule(modulePath.str(), thirdPath); */
+  return {firstPath, secondPath, thirdPath};
+}
+
 // TODO: move elsewhere
-static void patchFrontendOptions(std::vector<std::string>& frontendOptions) {
+static void patchFrontendOptions(codeql::SwiftExtractorConfiguration& config,
+                                 std::vector<std::string>& frontendOptions) {
+  std::unordered_map<std::string, std::string> remapping;
+
   // TODO: handle filelists?
   // TODO: handle -Xcc arguments (e.g. -Xcc -Isomething)?
   std::unordered_set<std::string> pathRewriteOptions({
@@ -63,11 +142,11 @@ static void patchFrontendOptions(std::vector<std::string>& frontendOptions) {
 
   // Defaulting to then root assuming that all the paths are absolute
   // TODO: be more flexible and check if the path is actually an absolute one
-  auto pathRewritePrefix = getenv_or("CODEQL_EXTRACTOR_SWIFT_SCRATCH_DIR", "./");
-  pathRewritePrefix += "/swift-extraction-artifacts";
+  auto pathRewritePrefix = config.scratchDir + "/swift-extraction-artifacts";
 
   std::vector<size_t> searchPathIndexes;
-  size_t supplementaryOutputsMapIndex = 0;
+  /* size_t supplementaryOutputsMapIndex = 0; */
+  std::vector<size_t> outputFileMapIndexes;
   std::vector<std::string> maybeInput;
 
   std::vector<std::string> newLocations;
@@ -77,11 +156,17 @@ static void patchFrontendOptions(std::vector<std::string>& frontendOptions) {
       auto newPath = pathRewritePrefix + '/' + oldPath;
       frontendOptions[++i] = newPath;
       newLocations.push_back(newPath);
-    } else if (frontendOptions[i] == "-supplementary-output-file-map") {
-      supplementaryOutputsMapIndex = i + 1;
+
+      remapping[oldPath] = newPath;
+    } else if (frontendOptions[i] == "-supplementary-output-file-map" ||
+               frontendOptions[i] == "-output-file-map") {
+      // collect output map indexes for further rewriting and skip the following argument
+      outputFileMapIndexes.push_back(++i);
     } else if (searchPathRewriteOptions.count(frontendOptions[i])) {
       // Collect search path options indexes for further new search path insertion
       searchPathIndexes.push_back(i);
+      // Skip the following argument
+      i++;
     } else if (frontendOptions[i][0] != '-') {
       // Maybe it's an input file generated by a previous invocation
       // In which case attempt to rewrite the argument if the new path exists
@@ -94,10 +179,10 @@ static void patchFrontendOptions(std::vector<std::string>& frontendOptions) {
     }
   }
 
-  if (supplementaryOutputsMapIndex != 0) {
-    auto oldPath = frontendOptions[supplementaryOutputsMapIndex];
+  for (auto index : outputFileMapIndexes) {
+    auto oldPath = frontendOptions[index];
     auto newPath = pathRewritePrefix + '/' + oldPath;
-    frontendOptions[supplementaryOutputsMapIndex] = newPath;
+    frontendOptions[index] = newPath;
 
     llvm::errs() << "DEBUGG: map" << newPath << "\n";
 
@@ -117,8 +202,11 @@ static void patchFrontendOptions(std::vector<std::string>& frontendOptions) {
           auto& newMap = newOutputMap.getOrCreateOutputMapForInput(key);
           newMap.copyFrom(*oldMap);
           for (auto& entry : newMap) {
-            entry.getSecond() = pathRewritePrefix + '/' + entry.getSecond();
+            auto oldPath = entry.getSecond();
+            auto newPath = pathRewritePrefix + '/' + oldPath;
+            entry.getSecond() = newPath;
             llvm::errs() << "DEBUGG: rewritten entry " << entry.second << "\n";
+            remapping[oldPath] = newPath;
           }
         }
       }
@@ -135,6 +223,60 @@ static void patchFrontendOptions(std::vector<std::string>& frontendOptions) {
     }
   }
 
+  // Re-create the directories as Swift frontend expects them to be present
+  for (auto& location : newLocations) {
+    llvm::SmallString<PATH_MAX> filepath(location);
+    llvm::StringRef parent = llvm::sys::path::parent_path(filepath);
+    if (std::error_code ec = llvm::sys::fs::create_directories(parent)) {
+      std::cerr << "Cannot create patched directory: " << ec.message() << "\n";
+      return;
+    }
+  }
+
+  for (auto& [_, newPath] : remapping) {
+    llvm::StringRef path(newPath);
+    if (path.endswith(".swiftmodule")) {
+      auto aliases = getAliases(path);
+      for (auto& alias : aliases) {
+        remapping[alias] = newPath;
+      }
+    }
+  }
+
+  auto vfsDir = config.scratchDir + "/vfs";
+  {
+    llvm::StringRef path(vfsDir);
+    if (std::error_code ec = llvm::sys::fs::create_directories(path)) {
+      std::cerr << "Cannot create VFS directory: " << ec.message() << "\n";
+      return;
+    }
+  }
+  auto vfsPath = vfsDir + '/' + std::to_string(getpid()) + "-vfs.yaml";
+  std::error_code ec;
+  llvm::raw_fd_ostream fd(vfsPath, ec, llvm::sys::fs::OF_None);
+  if (ec) {
+    std::cerr << "Cannot create VFS file: '" << vfsPath << "': " << ec.message() << "\n";
+    return;
+  }
+  fd << "{ version: 0,\n";
+  fd << "  roots: [\n";
+  size_t i = 0;
+  for (auto& [oldPath, newPath] : remapping) {
+    fd << "  {\n";
+    fd << "    type: 'file',\n";
+    fd << "    name: '" << oldPath << "\',\n";
+    fd << "    external-contents: '" << newPath << "\'\n";
+    fd << "  }";
+    if (++i != remapping.size()) {
+      fd << ",";
+    }
+    fd << "\n";
+  }
+  fd << "  ]\n";
+  fd << "}\n";
+
+  return;
+
   std::reverse(std::begin(searchPathIndexes), std::end(searchPathIndexes));
   for (auto index : searchPathIndexes) {
     // Inserting new search path right before the existing ones
@@ -147,73 +289,6 @@ static void patchFrontendOptions(std::vector<std::string>& frontendOptions) {
       it = frontendOptions.insert(it, newSearchPath);
       frontendOptions.insert(it, option);
     }
-  }
-
-  // Re-create the directories in case Swift frontend expects them to be present
-  for (auto& location : newLocations) {
-    llvm::SmallString<PATH_MAX> filepath(location);
-    llvm::StringRef parent = llvm::sys::path::parent_path(filepath);
-    if (std::error_code ec = llvm::sys::fs::create_directories(parent)) {
-      std::cerr << "Cannot create patched directory: " << ec.message() << "\n";
-      return;
-    }
-  }
-}
-
-static void attemptToCopyMergedModule(const std::vector<std::string>& options) {
-  // DerivedData/MovieSwift/Build/Intermediates.noindex/SwiftUIFlux.build/Debug-iphoneos/SwiftUIFlux.build/Objects-normal/arm64/SwiftUIFlux.swiftmodule
-  // DerivedData/MovieSwift/Build/Products/Debug-iphoneos/SwiftUIFlux.swiftmodule/arm64.swiftmodule
-  llvm::StringRef modulePath;
-  for (size_t i = 0; i < options.size(); i++) {
-    if (options[i] == "-o" || options[i] == "-emit-module-path") {
-      llvm::StringRef path(options[i + 1]);
-      if (path.endswith(".swiftmodule")) {
-        modulePath = options[i + 1];
-      }
-    }
-  }
-  if (modulePath.empty()) {
-    return;
-  }
-
-  llvm::SmallVector<llvm::StringRef> chunks;
-  modulePath.split(chunks, '/');
-  size_t intermediatesDirIndex = 0;
-  for (size_t i = 0; i < chunks.size(); i++) {
-    if (chunks[i] == "Intermediates.noindex") {
-      intermediatesDirIndex = i;
-      break;
-    }
-  }
-  // Not built by Xcode, skipping
-  if (intermediatesDirIndex == 0) {
-    return;
-  }
-  // e.g. Debug-iphoneos, Release-iphonesimulator, etc.
-  auto destinationDir = chunks[intermediatesDirIndex + 2].str();
-  auto arch = chunks[intermediatesDirIndex + 5].str();
-  auto moduleName = chunks.back().str();
-  std::string relocatedModulePath;
-  for (size_t i = 0; i < intermediatesDirIndex; i++) {
-    relocatedModulePath += '/' + chunks[i].str();
-  }
-  relocatedModulePath += "/Products/";
-  relocatedModulePath += destinationDir + '/';
-  relocatedModulePath += moduleName + '/';
-  relocatedModulePath += arch + ".swiftmodule";
-  llvm::SmallString<PATH_MAX> filepath(relocatedModulePath);
-  llvm::StringRef parent = llvm::sys::path::parent_path(filepath);
-  if (std::error_code ec = llvm::sys::fs::create_directories(parent)) {
-    std::cerr << "Cannot create relocated module path: " << ec.message() << "\n";
-    return;
-  }
-
-  llvm::SmallString<PATH_MAX> srcFilePath(modulePath);
-  llvm::SmallString<PATH_MAX> dstFilePath(relocatedModulePath);
-
-  if (std::error_code ec = llvm::sys::fs::copy_file(srcFilePath, dstFilePath)) {
-    std::cerr << "Cannot relocate archive '" << srcFilePath.str().str() << "' -> '"
-              << dstFilePath.str().str() << "': " << ec.message() << "\n";
   }
 }
 
@@ -229,13 +304,14 @@ int main(int argc, char** argv) {
   codeql::SwiftExtractorConfiguration configuration{};
   configuration.trapDir = getenv_or("CODEQL_EXTRACTOR_SWIFT_TRAP_DIR", ".");
   configuration.sourceArchiveDir = getenv_or("CODEQL_EXTRACTOR_SWIFT_SOURCE_ARCHIVE_DIR", ".");
+  configuration.scratchDir = getenv_or("CODEQL_EXTRACTOR_SWIFT_SCRATCH_DIR", ".");
 
   configuration.frontendOptions.reserve(argc - 1);
   for (int i = 1; i < argc; i++) {
     configuration.frontendOptions.push_back(argv[i]);
   }
   configuration.patchedFrontendOptions = configuration.frontendOptions;
-  patchFrontendOptions(configuration.patchedFrontendOptions);
+  patchFrontendOptions(configuration, configuration.patchedFrontendOptions);
 
   std::vector<const char*> args;
   std::cerr << "DEBUG swift-frontend-args:\n";
@@ -248,9 +324,9 @@ int main(int argc, char** argv) {
   Observer observer(configuration);
   int frontend_rc = swift::performFrontend(args, "swift-extractor", (void*)main, &observer);
 
-  if (!frontend_rc) {
-    attemptToCopyMergedModule(configuration.patchedFrontendOptions);
-  }
+  /* if (!frontend_rc) { */
+  /*   attemptToCopyMergedModule(observer.outputs); */
+  /* } */
 
   //-supplementary-output-file-map
   /// var/folders/10/hts02tt52j1b7x26bym0bp0c0000gn/T/TemporaryDirectory.860KhC/supplementaryOutputs-1
